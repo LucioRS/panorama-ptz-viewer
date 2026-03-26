@@ -1,0 +1,8 @@
+# Environments
+.venv
+
+# Byte-compiled
+__pycache__
+
+# cache folder
+/cache

@@ -1,0 +1,15 @@
+# Python packages installed with pip.
+#
+# For live THETA camera input through GStreamer/thetauvcsrc, also install the
+# Ubuntu system packages and the gstthetauvc plugin. Typical packages:
+#   sudo apt install -y \
+#     python3-gi python3-gst-1.0 gir1.2-gstreamer-1.0 \
+#     gir1.2-gst-plugins-base-1.0 gstreamer1.0-tools \
+#     gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+#     gstreamer1.0-plugins-bad gstreamer1.0-libav
+# Then make sure gstthetauvc is installed and visible to GStreamer:
+#   gst-inspect-1.0 thetauvcsrc
+imgui-bundle
+opencv-python
+PyOpenGL
+numpy
