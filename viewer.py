@@ -14,7 +14,6 @@ import numpy as np
 from imgui_bundle import hello_imgui, imgui
 from OpenGL.GL import (
     GL_ARRAY_BUFFER,
-    GL_BGR,
     GL_CLAMP_TO_EDGE,
     GL_COLOR_ATTACHMENT0,
     GL_COMPILE_STATUS,
@@ -26,9 +25,13 @@ from OpenGL.GL import (
     GL_FRAMEBUFFER_COMPLETE,
     GL_LINEAR,
     GL_LINK_STATUS,
+    GL_R8,
+    GL_RED,
     GL_RGB,
     GL_STATIC_DRAW,
     GL_TEXTURE0,
+    GL_TEXTURE1,
+    GL_TEXTURE2,
     GL_TEXTURE_2D,
     GL_TEXTURE_MAG_FILTER,
     GL_TEXTURE_MIN_FILTER,
@@ -84,7 +87,11 @@ from OpenGL.GL import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Single-file panorama + PTZ viewer with imgui docking. Supports ROS 2 raw Image, video file, or a live THETA camera via GStreamer/thetauvcsrc."
+        description=(
+            "Single-file panorama + PTZ viewer with imgui docking. Supports ROS 2 raw Image, "
+            "video file, or a live THETA camera via GStreamer/thetauvcsrc. "
+            "The default THETA path keeps frames in I420 and does YUV->RGB in the PTZ shader."
+        )
     )
     parser.add_argument(
         "video_path",
@@ -113,7 +120,10 @@ def parse_args() -> argparse.Namespace:
         "--gst-pipeline",
         dest="gst_pipeline",
         default=None,
-        help="Optional full GStreamer pipeline string. If omitted, a thetauvcsrc-based pipeline is used.",
+        help=(
+            "Optional full GStreamer pipeline string. For the shader I420 path, make sure it ends in "
+            "video/x-raw,format=I420 ! appsink name=theta_appsink ..."
+        ),
     )
     parser.add_argument(
         "--gst-pull-timeout-ms",
@@ -121,24 +131,111 @@ def parse_args() -> argparse.Namespace:
         default=200,
         help="Timeout in milliseconds when waiting for a frame from appsink in live camera mode.",
     )
-    parser.add_argument("--width", type=int, default=None, help="Optional target panorama width.")
-    parser.add_argument("--height", type=int, default=None, help="Optional target panorama height.")
-    parser.add_argument("--fps", type=float, default=30.0, help="Kept for CLI compatibility; not used by the default thetauvcsrc camera pipeline.")
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Optional target panorama width. Note: resizing I420 uses CPU work; omit for the fastest THETA path.",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="Optional target panorama height. Note: resizing I420 uses CPU work; omit for the fastest THETA path.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=30.0,
+        help="Kept for CLI compatibility; not used by the default thetauvcsrc camera pipeline.",
+    )
     parser.add_argument("--loop-video", action="store_true", help="Loop the video file when it reaches the end.")
     parser.add_argument("--reliable", action="store_true", help="Use RELIABLE QoS for ROS subscriptions.")
     return parser.parse_args()
 
 
 # =========================
-# Shared state
+# Frame types / helpers
 # =========================
+@dataclass
+class I420Frame:
+    width: int
+    height: int
+    y: np.ndarray
+    u: np.ndarray
+    v: np.ndarray
+
+
 @dataclass
 class PreviewImage:
     frame_id: int = -1
     ts: float = 0.0
-    pano_bgr_small: Optional[np.ndarray] = None
+    i420: Optional[I420Frame] = None
 
 
+def _sanitize_i420_size(width: int, height: int) -> tuple[int, int]:
+    width = max(2, int(width))
+    height = max(2, int(height))
+    # Keep dimensions even for 4:2:0. This avoids odd-size corner cases in downstream code.
+    if width % 2 != 0:
+        width -= 1
+    if height % 2 != 0:
+        height -= 1
+    return max(2, width), max(2, height)
+
+
+def bgr_to_i420_frame(img_bgr: np.ndarray) -> I420Frame:
+    img_bgr = np.ascontiguousarray(img_bgr)
+    h, w = img_bgr.shape[:2]
+    w, h = _sanitize_i420_size(w, h)
+    if img_bgr.shape[1] != w or img_bgr.shape[0] != h:
+        img_bgr = cv2.resize(img_bgr, (w, h), interpolation=cv2.INTER_AREA)
+
+    yuv_i420 = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YUV_I420)
+    flat = np.frombuffer(yuv_i420.data, dtype=np.uint8)
+
+    y_size = w * h
+    cw = w // 2
+    ch = h // 2
+    uv_size = cw * ch
+
+    y = flat[0:y_size].reshape(h, w).copy()
+    u = flat[y_size : y_size + uv_size].reshape(ch, cw).copy()
+    v = flat[y_size + uv_size : y_size + 2 * uv_size].reshape(ch, cw).copy()
+
+    return I420Frame(
+        width=w,
+        height=h,
+        y=np.ascontiguousarray(y),
+        u=np.ascontiguousarray(u),
+        v=np.ascontiguousarray(v),
+    )
+
+
+def resize_i420_frame(frame: I420Frame, target_w: int, target_h: int) -> I420Frame:
+    target_w, target_h = _sanitize_i420_size(target_w, target_h)
+    if frame.width == target_w and frame.height == target_h:
+        return frame
+
+    interp_y = cv2.INTER_AREA if frame.width > target_w else cv2.INTER_LINEAR
+    interp_uv = cv2.INTER_AREA if frame.width > target_w else cv2.INTER_LINEAR
+
+    y = cv2.resize(frame.y, (target_w, target_h), interpolation=interp_y)
+    u = cv2.resize(frame.u, (target_w // 2, target_h // 2), interpolation=interp_uv)
+    v = cv2.resize(frame.v, (target_w // 2, target_h // 2), interpolation=interp_uv)
+
+    return I420Frame(
+        width=target_w,
+        height=target_h,
+        y=np.ascontiguousarray(y),
+        u=np.ascontiguousarray(u),
+        v=np.ascontiguousarray(v),
+    )
+
+
+# =========================
+# Shared state
+# =========================
 class SharedState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -163,13 +260,12 @@ class SharedState:
         with self._lock:
             return self._paused
 
-    def put_pano_preview(self, frame_id: int, pano_bgr: np.ndarray, ts: float) -> None:
-        pano_bgr = np.ascontiguousarray(pano_bgr)
+    def put_pano_preview(self, frame_id: int, frame: I420Frame, ts: float) -> None:
         with self._lock:
             self._preview.frame_id = frame_id
             self._preview.ts = ts
-            self._preview.pano_bgr_small = pano_bgr
-            self._frame_shape = tuple(pano_bgr.shape)
+            self._preview.i420 = frame
+            self._frame_shape = (frame.height, frame.width, 3)
 
     def get_latest_preview(self) -> PreviewImage:
         with self._lock:
@@ -232,8 +328,7 @@ class ThetaGStreamerSource:
             f"! h264parse "
             f"! decodebin "
             f"! queue "
-            f"! videoconvert "
-            f"! video/x-raw,format=BGR "
+            f"! video/x-raw,format=I420 "
             f"! appsink name=theta_appsink emit-signals=false sync=false max-buffers=1 drop=true"
         )
 
@@ -291,12 +386,12 @@ class ThetaGStreamerSource:
             self._check_bus()
             raise RuntimeError(f"Failed to set GStreamer pipeline to PLAYING.\nPipeline: {self.pipeline_desc}")
 
-        state_ret, state, pending = self.pipeline.get_state(5 * Gst.SECOND)
+        state_ret, _, _ = self.pipeline.get_state(5 * Gst.SECOND)
         if state_ret == Gst.StateChangeReturn.FAILURE:
             self._check_bus()
             raise RuntimeError(f"GStreamer pipeline failed during startup.\nPipeline: {self.pipeline_desc}")
 
-    def _sample_to_bgr(self, sample) -> np.ndarray:
+    def _sample_to_i420(self, sample) -> I420Frame:
         Gst = self.Gst
         GstVideo = self.GstVideo
         if Gst is None or GstVideo is None:
@@ -311,10 +406,15 @@ class ThetaGStreamerSource:
         width = int(structure.get_value("width"))
         height = int(structure.get_value("height"))
 
+        if fmt != "I420":
+            raise RuntimeError(
+                f"Expected I420 from appsink, got: {fmt}. "
+                "For the shader conversion path, make the pipeline end with video/x-raw,format=I420."
+            )
+
         video_info = GstVideo.VideoInfo()
         if not video_info.from_caps(caps):
             raise RuntimeError(f"Could not parse video caps: {caps.to_string()}")
-        stride = int(video_info.stride[0])
 
         buffer = sample.get_buffer()
         if buffer is None:
@@ -327,31 +427,32 @@ class ThetaGStreamerSource:
         try:
             raw = np.frombuffer(map_info.data, dtype=np.uint8)
 
-            if fmt == "BGR":
-                row_bytes = width * 3
-                frame = raw.reshape((height, stride))[:, :row_bytes].reshape((height, width, 3))
-                return np.ascontiguousarray(frame)
+            cw = width // 2
+            ch = height // 2
 
-            if fmt == "BGRx":
-                row_bytes = width * 4
-                frame = raw.reshape((height, stride))[:, :row_bytes].reshape((height, width, 4))
-                return np.ascontiguousarray(frame[:, :, :3])
+            off_y = int(video_info.offset[0])
+            off_u = int(video_info.offset[1])
+            off_v = int(video_info.offset[2])
 
-            if fmt == "RGB":
-                row_bytes = width * 3
-                frame = raw.reshape((height, stride))[:, :row_bytes].reshape((height, width, 3))
-                return np.ascontiguousarray(frame[:, :, ::-1])
+            stride_y = int(video_info.stride[0])
+            stride_u = int(video_info.stride[1])
+            stride_v = int(video_info.stride[2])
 
-            if fmt == "RGBx":
-                row_bytes = width * 4
-                frame = raw.reshape((height, stride))[:, :row_bytes].reshape((height, width, 4))
-                return np.ascontiguousarray(frame[:, :, :3][:, :, ::-1])
+            y = raw[off_y : off_y + stride_y * height].reshape(height, stride_y)[:, :width].copy()
+            u = raw[off_u : off_u + stride_u * ch].reshape(ch, stride_u)[:, :cw].copy()
+            v = raw[off_v : off_v + stride_v * ch].reshape(ch, stride_v)[:, :cw].copy()
 
-            raise RuntimeError(f"Unsupported appsink format: {fmt}")
+            return I420Frame(
+                width=width,
+                height=height,
+                y=np.ascontiguousarray(y),
+                u=np.ascontiguousarray(u),
+                v=np.ascontiguousarray(v),
+            )
         finally:
             buffer.unmap(map_info)
 
-    def read_frame(self) -> Optional[np.ndarray]:
+    def read_frame(self) -> Optional[I420Frame]:
         if self.appsink is None or self.Gst is None:
             return None
 
@@ -364,7 +465,7 @@ class ThetaGStreamerSource:
         if sample is None:
             self._check_bus()
             return None
-        return self._sample_to_bgr(sample)
+        return self._sample_to_i420(sample)
 
     def close(self) -> None:
         if self.pipeline is not None and self.Gst is not None:
@@ -388,19 +489,19 @@ class OpenCVVideoFileSource:
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open video file: {self.path}")
 
-    def read_frame(self) -> Optional[np.ndarray]:
+    def read_frame(self) -> Optional[I420Frame]:
         if self.cap is None:
             return None
         ok, frame = self.cap.read()
         if ok and frame is not None:
-            return frame
+            return bgr_to_i420_frame(frame)
         if not self.loop:
             return None
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         ok, frame = self.cap.read()
         if not ok or frame is None:
             return None
-        return frame
+        return bgr_to_i420_frame(frame)
 
     def close(self) -> None:
         if self.cap is not None:
@@ -428,7 +529,7 @@ class ROSImageSource:
         self._spin_thread: Optional[threading.Thread] = None
         self._owns_rclpy = False
         self._cond = threading.Condition()
-        self._latest: Optional[np.ndarray] = None
+        self._latest: Optional[I420Frame] = None
         self._seq = 0
         self._last_read_seq = 0
         self._last_error: Optional[str] = None
@@ -478,7 +579,7 @@ class ROSImageSource:
 
         raise ValueError(f"Unsupported ROS image encoding: {msg.encoding}")
 
-    def _on_image(self, frame: np.ndarray) -> None:
+    def _on_image(self, frame: I420Frame) -> None:
         with self._cond:
             self._latest = frame
             self._last_error = None
@@ -516,8 +617,9 @@ class ROSImageSource:
 
             def _cb(self, msg: Image) -> None:
                 try:
-                    frame = outer._ros_image_to_bgr(msg)
-                    outer._on_image(frame)
+                    frame_bgr = outer._ros_image_to_bgr(msg)
+                    frame_i420 = bgr_to_i420_frame(frame_bgr)
+                    outer._on_image(frame_i420)
                 except Exception as exc:  # pragma: no cover - runtime path
                     outer._on_error(f"ROS image conversion failed: {exc}")
 
@@ -525,7 +627,7 @@ class ROSImageSource:
         self._spin_thread = threading.Thread(target=rclpy.spin, args=(self._node,), daemon=True, name="ROSImageSpin")
         self._spin_thread.start()
 
-    def read_frame(self) -> Optional[np.ndarray]:
+    def read_frame(self) -> Optional[I420Frame]:
         deadline = time.monotonic() + self.wait_timeout_sec
         with self._cond:
             start_seq = self._last_read_seq
@@ -539,7 +641,14 @@ class ROSImageSource:
                 return None
 
             self._last_read_seq = self._seq
-            return self._latest.copy()
+            frame = self._latest
+            return I420Frame(
+                width=frame.width,
+                height=frame.height,
+                y=frame.y.copy(),
+                u=frame.u.copy(),
+                v=frame.v.copy(),
+            )
 
     def close(self) -> None:
         with self._cond:
@@ -601,9 +710,7 @@ class CaptureWorker(threading.Thread):
 
                 if self.target_size is not None:
                     target_w, target_h = self.target_size
-                    if frame.shape[1] != target_w or frame.shape[0] != target_h:
-                        interpolation = cv2.INTER_AREA if frame.shape[1] > target_w else cv2.INTER_LINEAR
-                        frame = cv2.resize(frame, (target_w, target_h), interpolation=interpolation)
+                    frame = resize_i420_frame(frame, target_w, target_h)
 
                 now = time.perf_counter()
                 self.state.put_pano_preview(self.frame_id, frame, now)
@@ -624,10 +731,10 @@ class CaptureWorker(threading.Thread):
 
 
 # =========================
-# OpenGL texture wrapper
+# OpenGL texture wrappers
 # =========================
 @dataclass
-class GLTexture:
+class GLR8Texture:
     tex_id: int = 0
     w: int = 0
     h: int = 0
@@ -646,17 +753,17 @@ class GLTexture:
         self.ensure()
         if w == self.w and h == self.h:
             return
-        self.w, self.h = w, h
+        self.w, self.h = int(w), int(h)
         glBindTexture(GL_TEXTURE_2D, self.tex_id)
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_BGR, GL_UNSIGNED_BYTE, None)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, self.w, self.h, 0, GL_RED, GL_UNSIGNED_BYTE, None)
 
-    def upload_bgr(self, img_bgr: np.ndarray) -> None:
-        h, w = img_bgr.shape[:2]
+    def upload_plane(self, img: np.ndarray) -> None:
+        h, w = img.shape[:2]
         self.allocate(w, h)
         glBindTexture(GL_TEXTURE_2D, self.tex_id)
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGR, GL_UNSIGNED_BYTE, img_bgr)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RED, GL_UNSIGNED_BYTE, img)
 
     def destroy(self) -> None:
         if self.tex_id != 0:
@@ -688,7 +795,10 @@ FRAG_SRC = r"""
 in vec2 vUv;
 out vec4 FragColor;
 
-uniform sampler2D uPano;
+uniform sampler2D uPanoY;
+uniform sampler2D uPanoU;
+uniform sampler2D uPanoV;
+uniform int   uProjectionMode; // 0 = PTZ, 1 = panorama passthrough
 uniform float uYaw;
 uniform float uPitch;
 uniform float uHfov;
@@ -713,7 +823,25 @@ mat3 rotY(float a) {
     );
 }
 
-void main() {
+vec3 sampleI420_BT709_limited(vec2 uv) {
+    float y = texture(uPanoY, uv).r;
+    float u = texture(uPanoU, uv).r - 0.5;
+    float v = texture(uPanoV, uv).r - 0.5;
+
+    float yy = 1.16438356 * max(y - (16.0 / 255.0), 0.0);
+
+    vec3 rgb;
+    rgb.r = yy + 1.79274107 * v;
+    rgb.g = yy - 0.21324861 * u - 0.53290933 * v;
+    rgb.b = yy + 2.11240179 * u;
+    return clamp(rgb, 0.0, 1.0);
+}
+
+vec2 panoUvFromProjection() {
+    if (uProjectionMode == 1) {
+        return vUv;
+    }
+
     vec2 ndc = vUv * 2.0 - 1.0;
     float aspect = uOutSize.x / uOutSize.y;
     float tanHalfH = tan(uHfov * 0.5);
@@ -728,10 +856,12 @@ void main() {
     float u = lon / (2.0 * PI) + 0.5;
     float v = 0.5 - lat / PI;
 
-    u = fract(u);
-    v = clamp(v, 0.0, 1.0);
+    return vec2(fract(u), clamp(v, 0.0, 1.0));
+}
 
-    vec3 rgb = texture(uPano, vec2(u, v)).rgb;
+void main() {
+    vec2 uv = panoUvFromProjection();
+    vec3 rgb = sampleI420_BT709_limited(uv);
     FragColor = vec4(rgb, 1.0);
 }
 """
@@ -779,7 +909,11 @@ class PTZRenderer:
         self.out_tex = 0
         self.out_w = 0
         self.out_h = 0
-        self.u_pano = -1
+
+        self.u_pano_y = -1
+        self.u_pano_u = -1
+        self.u_pano_v = -1
+        self.u_projection_mode = -1
         self.u_yaw = -1
         self.u_pitch = -1
         self.u_hfov = -1
@@ -795,7 +929,10 @@ class PTZRenderer:
         glDeleteShader(vs)
         glDeleteShader(fs)
 
-        self.u_pano = glGetUniformLocation(self.program, "uPano")
+        self.u_pano_y = glGetUniformLocation(self.program, "uPanoY")
+        self.u_pano_u = glGetUniformLocation(self.program, "uPanoU")
+        self.u_pano_v = glGetUniformLocation(self.program, "uPanoV")
+        self.u_projection_mode = glGetUniformLocation(self.program, "uProjectionMode")
         self.u_yaw = glGetUniformLocation(self.program, "uYaw")
         self.u_pitch = glGetUniformLocation(self.program, "uPitch")
         self.u_hfov = glGetUniformLocation(self.program, "uHfov")
@@ -857,21 +994,36 @@ class PTZRenderer:
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0)
 
-    def render(self, pano_tex_id: int, state: PTZState, out_size: tuple[int, int]) -> int:
+    def render(
+        self,
+        tex_y: int,
+        tex_u: int,
+        tex_v: int,
+        state: PTZState,
+        out_size: tuple[int, int],
+        projection_mode: int,
+    ) -> int:
         self.ensure_fbo(out_size[0], out_size[1])
         glDisable(GL_DEPTH_TEST)
         glBindFramebuffer(GL_FRAMEBUFFER, self.fbo)
         glViewport(0, 0, self.out_w, self.out_h)
 
         glUseProgram(self.program)
-        glUniform1i(self.u_pano, 0)
+        glUniform1i(self.u_pano_y, 0)
+        glUniform1i(self.u_pano_u, 1)
+        glUniform1i(self.u_pano_v, 2)
+        glUniform1i(self.u_projection_mode, int(projection_mode))
         glUniform1f(self.u_yaw, math.radians(state.yaw_deg))
         glUniform1f(self.u_pitch, math.radians(state.pitch_deg))
         glUniform1f(self.u_hfov, math.radians(state.hfov_deg))
         glUniform2f(self.u_out_size, float(self.out_w), float(self.out_h))
 
         glActiveTexture(GL_TEXTURE0)
-        glBindTexture(GL_TEXTURE_2D, int(pano_tex_id))
+        glBindTexture(GL_TEXTURE_2D, int(tex_y))
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, int(tex_u))
+        glActiveTexture(GL_TEXTURE2)
+        glBindTexture(GL_TEXTURE_2D, int(tex_v))
 
         glBindVertexArray(self.vao)
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
@@ -964,14 +1116,23 @@ def _unwrap_u(u: np.ndarray) -> np.ndarray:
 class ViewerGui:
     def __init__(self, state: SharedState) -> None:
         self.state = state
-        self.pano_tex = GLTexture()
-        self._last_uploaded_pano_id = -1
 
+        self.tex_y = GLR8Texture()
+        self.tex_u = GLR8Texture()
+        self.tex_v = GLR8Texture()
+        self._last_uploaded_pano_id = -1
+        self._pano_w = 0
+        self._pano_h = 0
+
+        self.pano_renderer = PTZRenderer()
         self.ptz = PTZRenderer()
+
         self.ptz_state = PTZState(yaw_deg=0.0, pitch_deg=0.0, hfov_deg=90.0)
         self._ptz_dirty = True
         self._ptz_last_input_frame = -1
         self._ptz_out_tex_id = 0
+        self._pano_out_tex_id = 0
+        self._pano_last_rendered_frame = -1
         self._ptz_render_scale = 1.0
 
     def _imgui_image(self, tex_id: int, disp_w: int, disp_h: int, *, flip_v: bool = False) -> None:
@@ -1044,12 +1205,34 @@ class ViewerGui:
 
     def _ensure_pano_uploaded(self) -> Optional[PreviewImage]:
         preview = self.state.get_latest_preview()
-        if preview.pano_bgr_small is None:
+        if preview.i420 is None:
             return None
+
         if preview.frame_id != self._last_uploaded_pano_id:
-            self.pano_tex.upload_bgr(preview.pano_bgr_small)
+            frame = preview.i420
+            self.tex_y.upload_plane(frame.y)
+            self.tex_u.upload_plane(frame.u)
+            self.tex_v.upload_plane(frame.v)
+            self._pano_w = frame.width
+            self._pano_h = frame.height
             self._last_uploaded_pano_id = preview.frame_id
+            self._ptz_dirty = True
         return preview
+
+    def _ensure_pano_rendered(self, preview: PreviewImage) -> None:
+        if preview.frame_id == self._pano_last_rendered_frame:
+            return
+        if self.tex_y.tex_id == 0 or self.tex_u.tex_id == 0 or self.tex_v.tex_id == 0:
+            return
+        self._pano_out_tex_id = self.pano_renderer.render(
+            self.tex_y.tex_id,
+            self.tex_u.tex_id,
+            self.tex_v.tex_id,
+            self.ptz_state,
+            (self._pano_w, self._pano_h),
+            projection_mode=1,
+        )
+        self._pano_last_rendered_frame = preview.frame_id
 
     def pano_window_gui(self) -> None:
         snap = self.state.ui_snapshot()
@@ -1075,13 +1258,14 @@ class ViewerGui:
             imgui.text_disabled("Waiting for panorama preview...")
             return
 
+        self._ensure_pano_rendered(preview)
+
         avail_w = max(200.0, float(imgui.get_content_region_avail().x))
-        h, w = preview.pano_bgr_small.shape[:2]
         disp_w = int(avail_w)
-        disp_h = int(disp_w * (h / w))
+        disp_h = int(disp_w * (self._pano_h / max(1, self._pano_w)))
 
         imgui.text("Panorama")
-        self._imgui_image(self.pano_tex.tex_id, disp_w, disp_h, flip_v=False)
+        self._imgui_image(self._pano_out_tex_id, disp_w, disp_h, flip_v=True)
 
     def ptz_window_gui(self) -> None:
         preview = self._ensure_pano_uploaded()
@@ -1089,9 +1273,11 @@ class ViewerGui:
             imgui.text_disabled("Waiting for panorama preview...")
             return
 
-        if self.pano_tex.tex_id == 0 or self.pano_tex.w <= 0 or self.pano_tex.h <= 0:
-            imgui.text_disabled("PTZ: pano texture not ready yet")
+        if self.tex_y.tex_id == 0 or self.tex_u.tex_id == 0 or self.tex_v.tex_id == 0:
+            imgui.text_disabled("PTZ: pano textures not ready yet")
             return
+
+        self._ensure_pano_rendered(preview)
 
         imgui.text("PTZ: drag LMB pan/tilt • wheel zoom • double-click recenter")
         imgui.text_disabled("Double-click recenters at cursor. Thumbnail shows the current PTZ footprint.")
@@ -1133,17 +1319,24 @@ class ViewerGui:
             self._ptz_last_input_frame = preview.frame_id
             self._ptz_dirty = True
 
-        out_w = max(1, int(round(self.pano_tex.w * self._ptz_render_scale)))
-        out_h = max(1, int(round(self.pano_tex.h * self._ptz_render_scale)))
+        out_w = max(1, int(round(self._pano_w * self._ptz_render_scale)))
+        out_h = max(1, int(round(self._pano_h * self._ptz_render_scale)))
         if self._ptz_dirty:
-            self._ptz_out_tex_id = self.ptz.render(self.pano_tex.tex_id, self.ptz_state, (out_w, out_h))
+            self._ptz_out_tex_id = self.ptz.render(
+                self.tex_y.tex_id,
+                self.tex_u.tex_id,
+                self.tex_v.tex_id,
+                self.ptz_state,
+                (out_w, out_h),
+                projection_mode=0,
+            )
             self._ptz_dirty = False
 
         avail = imgui.get_content_region_avail()
         max_w = max(200.0, float(avail.x))
         max_h = max(120.0, float(avail.y))
 
-        pano_aspect = self.pano_tex.w / max(1.0, float(self.pano_tex.h))
+        pano_aspect = self._pano_w / max(1.0, float(self._pano_h))
         disp_w = min(max_w, max_h * pano_aspect)
         disp_h = disp_w / max(1e-6, pano_aspect)
         disp_w_i = int(disp_w)
@@ -1154,7 +1347,7 @@ class ViewerGui:
         self._draw_pano_thumbnail_with_roi_poly(disp_w_i, disp_h_i)
 
     def _draw_pano_thumbnail_with_roi_poly(self, disp_w: int, disp_h: int) -> None:
-        if self.pano_tex.tex_id == 0:
+        if self._pano_out_tex_id == 0:
             return
 
         img_min = imgui.get_item_rect_min()
@@ -1166,7 +1359,7 @@ class ViewerGui:
 
         margin = 10.0
         max_size = 170.0
-        pano_aspect = self.pano_tex.w / max(1.0, float(self.pano_tex.h))
+        pano_aspect = self._pano_w / max(1.0, float(self._pano_h))
         if pano_aspect >= 1.0:
             thumb_w = max_size
             thumb_h = max_size / pano_aspect
@@ -1187,17 +1380,17 @@ class ViewerGui:
 
         draw_list = imgui.get_window_draw_list()
         white = imgui.get_color_u32(imgui.ImVec4(1.0, 1.0, 1.0, 1.0))
-        tex = imgui.ImTextureRef(int(self.pano_tex.tex_id))
+        tex = imgui.ImTextureRef(int(self._pano_out_tex_id))
         draw_list.add_image_quad(
             tex,
             imgui.ImVec2(x0, y0),
             imgui.ImVec2(x0, y1),
             imgui.ImVec2(x1, y1),
             imgui.ImVec2(x1, y0),
-            imgui.ImVec2(0.0, 0.0),
             imgui.ImVec2(0.0, 1.0),
-            imgui.ImVec2(1.0, 1.0),
+            imgui.ImVec2(0.0, 0.0),
             imgui.ImVec2(1.0, 0.0),
+            imgui.ImVec2(1.0, 1.0),
             white,
         )
         draw_list.add_quad(
@@ -1229,7 +1422,10 @@ class ViewerGui:
             draw_list.add_line(imgui.ImVec2(xa, ya), imgui.ImVec2(xb, yb), white, 2.0)
 
     def before_exit(self) -> None:
-        self.pano_tex.destroy()
+        self.tex_y.destroy()
+        self.tex_u.destroy()
+        self.tex_v.destroy()
+        self.pano_renderer.destroy()
         self.ptz.destroy()
 
 
@@ -1308,9 +1504,9 @@ def build_source(args: argparse.Namespace):
         pull_timeout_ms=args.gst_pull_timeout_ms,
     )
     if args.gst_pipeline:
-        desc = "Live camera: custom GStreamer pipeline"
+        desc = "Live camera: custom GStreamer pipeline (expects I420 at appsink)"
     else:
-        desc = f"Live camera: thetauvcsrc ({args.camera_mode})"
+        desc = f"Live camera: thetauvcsrc ({args.camera_mode}, I420 shader path)"
         if args.theta_serial:
             desc += f" serial={args.theta_serial}"
     return source, desc

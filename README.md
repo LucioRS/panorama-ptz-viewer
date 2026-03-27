@@ -88,7 +88,7 @@ python3 viewer.py --camera-mode 2K --theta-serial YOUR_SERIAL
 You can also provide a custom GStreamer pipeline:
 
 ```bash
-python3 viewer.py --gst-pipeline "thetauvcsrc mode=4K ! queue ! h264parse ! decodebin ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink name=theta_appsink emit-signals=false sync=false max-buffers=1 drop=true"
+python3 viewer.py --gst-pipeline "thetauvcsrc mode=4K ! queue ! h264parse ! decodebin ! queue ! videoconvert ! video/x-raw,format=I420 ! appsink name=theta_appsink emit-signals=false sync=false max-buffers=1 drop=true"
 ```
 
 ## Example ROS 2 republish workflow
@@ -108,18 +108,3 @@ Then launch the viewer:
 ```bash
 python3 viewer.py --ros-topic /camera/image_decoded
 ```
-
-## Controls
-
-- **Panorama window**
-  - click / drag to move the PTZ target
-
-- **PTZ window**
-  - drag to pan / tilt
-  - mouse wheel to zoom
-
-- **Keyboard**
-  - `W A S D` or arrow keys: pan / tilt
-  - `+` / `-`: zoom
-  - `R`: reset PTZ
-  - `Q` or `Esc`: quit
