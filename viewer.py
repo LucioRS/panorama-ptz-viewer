@@ -27,11 +27,14 @@ from OpenGL.GL import (
     GL_LINK_STATUS,
     GL_R8,
     GL_RED,
+    GL_RG,
+    GL_RG8,
     GL_RGB,
     GL_STATIC_DRAW,
     GL_TEXTURE0,
     GL_TEXTURE1,
     GL_TEXTURE2,
+    GL_TEXTURE3,
     GL_TEXTURE_2D,
     GL_TEXTURE_MAG_FILTER,
     GL_TEXTURE_MIN_FILTER,
@@ -90,7 +93,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Single-file panorama + PTZ viewer with imgui docking. Supports ROS 2 raw Image, "
             "video file, or a live THETA camera via GStreamer/thetauvcsrc. "
-            "The default THETA path keeps frames in I420 and does YUV->RGB in the PTZ shader."
+            "The default THETA path keeps frames in NV12/I420 and does YUV->RGB in the PTZ shader."
         )
     )
     parser.add_argument(
@@ -135,13 +138,13 @@ def parse_args() -> argparse.Namespace:
         "--width",
         type=int,
         default=None,
-        help="Optional target panorama width. Note: resizing I420 uses CPU work; omit for the fastest THETA path.",
+        help="Optional target panorama width. Note: resizing YUV420 frames uses CPU work; omit for the fastest THETA path.",
     )
     parser.add_argument(
         "--height",
         type=int,
         default=None,
-        help="Optional target panorama height. Note: resizing I420 uses CPU work; omit for the fastest THETA path.",
+        help="Optional target panorama height. Note: resizing YUV420 frames uses CPU work; omit for the fastest THETA path.",
     )
     parser.add_argument(
         "--fps",
@@ -157,26 +160,42 @@ def parse_args() -> argparse.Namespace:
 # =========================
 # Frame types / helpers
 # =========================
+YUV420_I420 = "I420"
+YUV420_NV12 = "NV12"
+
+
 @dataclass
-class I420Frame:
+class YUV420Frame:
     width: int
     height: int
+    format: str
     y: np.ndarray
-    u: np.ndarray
-    v: np.ndarray
+    u: Optional[np.ndarray] = None
+    v: Optional[np.ndarray] = None
+    uv: Optional[np.ndarray] = None
+
+    def copy(self) -> "YUV420Frame":
+        return YUV420Frame(
+            width=self.width,
+            height=self.height,
+            format=self.format,
+            y=np.ascontiguousarray(self.y.copy()),
+            u=None if self.u is None else np.ascontiguousarray(self.u.copy()),
+            v=None if self.v is None else np.ascontiguousarray(self.v.copy()),
+            uv=None if self.uv is None else np.ascontiguousarray(self.uv.copy()),
+        )
 
 
 @dataclass
 class PreviewImage:
     frame_id: int = -1
     ts: float = 0.0
-    i420: Optional[I420Frame] = None
+    frame: Optional[YUV420Frame] = None
 
 
-def _sanitize_i420_size(width: int, height: int) -> tuple[int, int]:
+def _sanitize_yuv420_size(width: int, height: int) -> tuple[int, int]:
     width = max(2, int(width))
     height = max(2, int(height))
-    # Keep dimensions even for 4:2:0. This avoids odd-size corner cases in downstream code.
     if width % 2 != 0:
         width -= 1
     if height % 2 != 0:
@@ -184,10 +203,10 @@ def _sanitize_i420_size(width: int, height: int) -> tuple[int, int]:
     return max(2, width), max(2, height)
 
 
-def bgr_to_i420_frame(img_bgr: np.ndarray) -> I420Frame:
+def bgr_to_i420_frame(img_bgr: np.ndarray) -> YUV420Frame:
     img_bgr = np.ascontiguousarray(img_bgr)
     h, w = img_bgr.shape[:2]
-    w, h = _sanitize_i420_size(w, h)
+    w, h = _sanitize_yuv420_size(w, h)
     if img_bgr.shape[1] != w or img_bgr.shape[0] != h:
         img_bgr = cv2.resize(img_bgr, (w, h), interpolation=cv2.INTER_AREA)
 
@@ -203,17 +222,19 @@ def bgr_to_i420_frame(img_bgr: np.ndarray) -> I420Frame:
     u = flat[y_size : y_size + uv_size].reshape(ch, cw).copy()
     v = flat[y_size + uv_size : y_size + 2 * uv_size].reshape(ch, cw).copy()
 
-    return I420Frame(
+    return YUV420Frame(
         width=w,
         height=h,
+        format=YUV420_I420,
         y=np.ascontiguousarray(y),
         u=np.ascontiguousarray(u),
         v=np.ascontiguousarray(v),
+        uv=None,
     )
 
 
-def resize_i420_frame(frame: I420Frame, target_w: int, target_h: int) -> I420Frame:
-    target_w, target_h = _sanitize_i420_size(target_w, target_h)
+def resize_yuv420_frame(frame: YUV420Frame, target_w: int, target_h: int) -> YUV420Frame:
+    target_w, target_h = _sanitize_yuv420_size(target_w, target_h)
     if frame.width == target_w and frame.height == target_h:
         return frame
 
@@ -221,16 +242,39 @@ def resize_i420_frame(frame: I420Frame, target_w: int, target_h: int) -> I420Fra
     interp_uv = cv2.INTER_AREA if frame.width > target_w else cv2.INTER_LINEAR
 
     y = cv2.resize(frame.y, (target_w, target_h), interpolation=interp_y)
-    u = cv2.resize(frame.u, (target_w // 2, target_h // 2), interpolation=interp_uv)
-    v = cv2.resize(frame.v, (target_w // 2, target_h // 2), interpolation=interp_uv)
 
-    return I420Frame(
-        width=target_w,
-        height=target_h,
-        y=np.ascontiguousarray(y),
-        u=np.ascontiguousarray(u),
-        v=np.ascontiguousarray(v),
-    )
+    if frame.format == YUV420_I420:
+        if frame.u is None or frame.v is None:
+            raise ValueError("I420 frame is missing U/V planes")
+        u = cv2.resize(frame.u, (target_w // 2, target_h // 2), interpolation=interp_uv)
+        v = cv2.resize(frame.v, (target_w // 2, target_h // 2), interpolation=interp_uv)
+        return YUV420Frame(
+            width=target_w,
+            height=target_h,
+            format=YUV420_I420,
+            y=np.ascontiguousarray(y),
+            u=np.ascontiguousarray(u),
+            v=np.ascontiguousarray(v),
+            uv=None,
+        )
+
+    if frame.format == YUV420_NV12:
+        if frame.uv is None:
+            raise ValueError("NV12 frame is missing UV plane")
+        uv = cv2.resize(frame.uv, (target_w // 2, target_h // 2), interpolation=interp_uv)
+        if uv.ndim == 2:
+            uv = uv.reshape(target_h // 2, target_w // 2, 2)
+        return YUV420Frame(
+            width=target_w,
+            height=target_h,
+            format=YUV420_NV12,
+            y=np.ascontiguousarray(y),
+            u=None,
+            v=None,
+            uv=np.ascontiguousarray(uv),
+        )
+
+    raise ValueError(f"Unsupported YUV420 format for resize: {frame.format}")
 
 
 # =========================
@@ -260,11 +304,11 @@ class SharedState:
         with self._lock:
             return self._paused
 
-    def put_pano_preview(self, frame_id: int, frame: I420Frame, ts: float) -> None:
+    def put_pano_preview(self, frame_id: int, frame: YUV420Frame, ts: float) -> None:
         with self._lock:
             self._preview.frame_id = frame_id
             self._preview.ts = ts
-            self._preview.i420 = frame
+            self._preview.frame = frame
             self._frame_shape = (frame.height, frame.width, 3)
 
     def get_latest_preview(self) -> PreviewImage:
@@ -328,7 +372,7 @@ class ThetaGStreamerSource:
             f"! h264parse "
             f"! decodebin "
             f"! queue "
-            f"! video/x-raw,format=I420 "
+            f"! video/x-raw "
             f"! appsink name=theta_appsink emit-signals=false sync=false max-buffers=1 drop=true"
         )
 
@@ -391,7 +435,7 @@ class ThetaGStreamerSource:
             self._check_bus()
             raise RuntimeError(f"GStreamer pipeline failed during startup.\nPipeline: {self.pipeline_desc}")
 
-    def _sample_to_i420(self, sample) -> I420Frame:
+    def _sample_to_yuv420(self, sample) -> YUV420Frame:
         Gst = self.Gst
         GstVideo = self.GstVideo
         if Gst is None or GstVideo is None:
@@ -406,14 +450,8 @@ class ThetaGStreamerSource:
         width = int(structure.get_value("width"))
         height = int(structure.get_value("height"))
 
-        if fmt != "I420":
-            raise RuntimeError(
-                f"Expected I420 from appsink, got: {fmt}. "
-                "For the shader conversion path, make the pipeline end with video/x-raw,format=I420."
-            )
-
-        video_info = GstVideo.VideoInfo()
-        if not video_info.from_caps(caps):
+        video_info = GstVideo.VideoInfo.new_from_caps(caps)
+        if video_info is None:
             raise RuntimeError(f"Could not parse video caps: {caps.to_string()}")
 
         buffer = sample.get_buffer()
@@ -431,28 +469,46 @@ class ThetaGStreamerSource:
             ch = height // 2
 
             off_y = int(video_info.offset[0])
-            off_u = int(video_info.offset[1])
-            off_v = int(video_info.offset[2])
-
             stride_y = int(video_info.stride[0])
-            stride_u = int(video_info.stride[1])
-            stride_v = int(video_info.stride[2])
-
             y = raw[off_y : off_y + stride_y * height].reshape(height, stride_y)[:, :width].copy()
-            u = raw[off_u : off_u + stride_u * ch].reshape(ch, stride_u)[:, :cw].copy()
-            v = raw[off_v : off_v + stride_v * ch].reshape(ch, stride_v)[:, :cw].copy()
 
-            return I420Frame(
+            if fmt == YUV420_I420:
+                off_u = int(video_info.offset[1])
+                off_v = int(video_info.offset[2])
+                stride_u = int(video_info.stride[1])
+                stride_v = int(video_info.stride[2])
+
+                u = raw[off_u : off_u + stride_u * ch].reshape(ch, stride_u)[:, :cw].copy()
+                v = raw[off_v : off_v + stride_v * ch].reshape(ch, stride_v)[:, :cw].copy()
+
+                return YUV420Frame(
+                    width=width,
+                    height=height,
+                    format=YUV420_I420,
+                    y=np.ascontiguousarray(y),
+                    u=np.ascontiguousarray(u),
+                    v=np.ascontiguousarray(v),
+                    uv=None,
+                )
+
+            off_uv = int(video_info.offset[1])
+            stride_uv = int(video_info.stride[1])
+            uv_bytes = raw[off_uv : off_uv + stride_uv * ch].reshape(ch, stride_uv)[:, : (cw * 2)].copy()
+            uv = uv_bytes.reshape(ch, cw, 2)
+
+            return YUV420Frame(
                 width=width,
                 height=height,
+                format=YUV420_NV12,
                 y=np.ascontiguousarray(y),
-                u=np.ascontiguousarray(u),
-                v=np.ascontiguousarray(v),
+                u=None,
+                v=None,
+                uv=np.ascontiguousarray(uv),
             )
         finally:
             buffer.unmap(map_info)
 
-    def read_frame(self) -> Optional[I420Frame]:
+    def read_frame(self) -> Optional[YUV420Frame]:
         if self.appsink is None or self.Gst is None:
             return None
 
@@ -465,7 +521,7 @@ class ThetaGStreamerSource:
         if sample is None:
             self._check_bus()
             return None
-        return self._sample_to_i420(sample)
+        return self._sample_to_yuv420(sample)
 
     def close(self) -> None:
         if self.pipeline is not None and self.Gst is not None:
@@ -489,7 +545,7 @@ class OpenCVVideoFileSource:
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open video file: {self.path}")
 
-    def read_frame(self) -> Optional[I420Frame]:
+    def read_frame(self) -> Optional[YUV420Frame]:
         if self.cap is None:
             return None
         ok, frame = self.cap.read()
@@ -529,7 +585,7 @@ class ROSImageSource:
         self._spin_thread: Optional[threading.Thread] = None
         self._owns_rclpy = False
         self._cond = threading.Condition()
-        self._latest: Optional[I420Frame] = None
+        self._latest: Optional[YUV420Frame] = None
         self._seq = 0
         self._last_read_seq = 0
         self._last_error: Optional[str] = None
@@ -579,7 +635,7 @@ class ROSImageSource:
 
         raise ValueError(f"Unsupported ROS image encoding: {msg.encoding}")
 
-    def _on_image(self, frame: I420Frame) -> None:
+    def _on_image(self, frame: YUV420Frame) -> None:
         with self._cond:
             self._latest = frame
             self._last_error = None
@@ -627,7 +683,7 @@ class ROSImageSource:
         self._spin_thread = threading.Thread(target=rclpy.spin, args=(self._node,), daemon=True, name="ROSImageSpin")
         self._spin_thread.start()
 
-    def read_frame(self) -> Optional[I420Frame]:
+    def read_frame(self) -> Optional[YUV420Frame]:
         deadline = time.monotonic() + self.wait_timeout_sec
         with self._cond:
             start_seq = self._last_read_seq
@@ -642,13 +698,7 @@ class ROSImageSource:
 
             self._last_read_seq = self._seq
             frame = self._latest
-            return I420Frame(
-                width=frame.width,
-                height=frame.height,
-                y=frame.y.copy(),
-                u=frame.u.copy(),
-                v=frame.v.copy(),
-            )
+            return frame.copy()
 
     def close(self) -> None:
         with self._cond:
@@ -710,7 +760,7 @@ class CaptureWorker(threading.Thread):
 
                 if self.target_size is not None:
                     target_w, target_h = self.target_size
-                    frame = resize_i420_frame(frame, target_w, target_h)
+                    frame = resize_yuv420_frame(frame, target_w, target_h)
 
                 now = time.perf_counter()
                 self.state.put_pano_preview(self.frame_id, frame, now)
@@ -776,6 +826,52 @@ class GLR8Texture:
             self.h = 0
 
 
+
+@dataclass
+class GLRG8Texture:
+    tex_id: int = 0
+    w: int = 0
+    h: int = 0
+
+    def ensure(self) -> None:
+        if self.tex_id != 0:
+            return
+        self.tex_id = int(glGenTextures(1))
+        glBindTexture(GL_TEXTURE_2D, self.tex_id)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+
+    def allocate(self, w: int, h: int) -> None:
+        self.ensure()
+        if w == self.w and h == self.h:
+            return
+        self.w, self.h = int(w), int(h)
+        glBindTexture(GL_TEXTURE_2D, self.tex_id)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, self.w, self.h, 0, GL_RG, GL_UNSIGNED_BYTE, None)
+
+    def upload_plane(self, img: np.ndarray) -> None:
+        if img.ndim != 3 or img.shape[2] != 2:
+            raise ValueError(f"Expected HxWx2 UV plane for GL_RG upload, got shape={img.shape}")
+        h, w = img.shape[:2]
+        self.allocate(w, h)
+        glBindTexture(GL_TEXTURE_2D, self.tex_id)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RG, GL_UNSIGNED_BYTE, img)
+
+    def destroy(self) -> None:
+        if self.tex_id != 0:
+            try:
+                glDeleteTextures([self.tex_id])
+            except Exception:
+                pass
+            self.tex_id = 0
+            self.w = 0
+            self.h = 0
+
+
 # =========================
 # PTZ shader renderer
 # =========================
@@ -798,12 +894,16 @@ out vec4 FragColor;
 uniform sampler2D uPanoY;
 uniform sampler2D uPanoU;
 uniform sampler2D uPanoV;
+uniform sampler2D uPanoUV;
+uniform int   uYuvFormat;      // 0 = I420, 1 = NV12
 uniform int   uProjectionMode; // 0 = PTZ, 1 = panorama passthrough
 uniform float uYaw;
 uniform float uPitch;
 uniform float uHfov;
 uniform vec2  uOutSize;
 
+const int YUV_FORMAT_I420 = 0;
+const int YUV_FORMAT_NV12 = 1;
 const float PI = 3.14159265358979323846;
 
 mat3 rotX(float a) {
@@ -823,10 +923,19 @@ mat3 rotY(float a) {
     );
 }
 
-vec3 sampleI420_BT709_limited(vec2 uv) {
+vec3 sampleYUV420_BT709_limited(vec2 uv) {
     float y = texture(uPanoY, uv).r;
-    float u = texture(uPanoU, uv).r - 0.5;
-    float v = texture(uPanoV, uv).r - 0.5;
+    float u;
+    float v;
+
+    if (uYuvFormat == YUV_FORMAT_NV12) {
+        vec2 uv_rg = texture(uPanoUV, uv).rg;
+        u = uv_rg.r - 0.5;
+        v = uv_rg.g - 0.5;
+    } else {
+        u = texture(uPanoU, uv).r - 0.5;
+        v = texture(uPanoV, uv).r - 0.5;
+    }
 
     float yy = 1.16438356 * max(y - (16.0 / 255.0), 0.0);
 
@@ -861,7 +970,7 @@ vec2 panoUvFromProjection() {
 
 void main() {
     vec2 uv = panoUvFromProjection();
-    vec3 rgb = sampleI420_BT709_limited(uv);
+    vec3 rgb = sampleYUV420_BT709_limited(uv);
     FragColor = vec4(rgb, 1.0);
 }
 """
@@ -913,6 +1022,8 @@ class PTZRenderer:
         self.u_pano_y = -1
         self.u_pano_u = -1
         self.u_pano_v = -1
+        self.u_pano_uv = -1
+        self.u_yuv_format = -1
         self.u_projection_mode = -1
         self.u_yaw = -1
         self.u_pitch = -1
@@ -932,6 +1043,8 @@ class PTZRenderer:
         self.u_pano_y = glGetUniformLocation(self.program, "uPanoY")
         self.u_pano_u = glGetUniformLocation(self.program, "uPanoU")
         self.u_pano_v = glGetUniformLocation(self.program, "uPanoV")
+        self.u_pano_uv = glGetUniformLocation(self.program, "uPanoUV")
+        self.u_yuv_format = glGetUniformLocation(self.program, "uYuvFormat")
         self.u_projection_mode = glGetUniformLocation(self.program, "uProjectionMode")
         self.u_yaw = glGetUniformLocation(self.program, "uYaw")
         self.u_pitch = glGetUniformLocation(self.program, "uPitch")
@@ -996,9 +1109,11 @@ class PTZRenderer:
 
     def render(
         self,
+        frame_format: str,
         tex_y: int,
         tex_u: int,
         tex_v: int,
+        tex_uv: int,
         state: PTZState,
         out_size: tuple[int, int],
         projection_mode: int,
@@ -1008,10 +1123,14 @@ class PTZRenderer:
         glBindFramebuffer(GL_FRAMEBUFFER, self.fbo)
         glViewport(0, 0, self.out_w, self.out_h)
 
+        yuv_format_value = 0 if frame_format == YUV420_I420 else 1
+
         glUseProgram(self.program)
         glUniform1i(self.u_pano_y, 0)
         glUniform1i(self.u_pano_u, 1)
         glUniform1i(self.u_pano_v, 2)
+        glUniform1i(self.u_pano_uv, 3)
+        glUniform1i(self.u_yuv_format, yuv_format_value)
         glUniform1i(self.u_projection_mode, int(projection_mode))
         glUniform1f(self.u_yaw, math.radians(state.yaw_deg))
         glUniform1f(self.u_pitch, math.radians(state.pitch_deg))
@@ -1024,6 +1143,8 @@ class PTZRenderer:
         glBindTexture(GL_TEXTURE_2D, int(tex_u))
         glActiveTexture(GL_TEXTURE2)
         glBindTexture(GL_TEXTURE_2D, int(tex_v))
+        glActiveTexture(GL_TEXTURE3)
+        glBindTexture(GL_TEXTURE_2D, int(tex_uv))
 
         glBindVertexArray(self.vao)
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
@@ -1120,7 +1241,9 @@ class ViewerGui:
         self.tex_y = GLR8Texture()
         self.tex_u = GLR8Texture()
         self.tex_v = GLR8Texture()
+        self.tex_uv = GLRG8Texture()
         self._last_uploaded_pano_id = -1
+        self._pano_format = YUV420_I420
         self._pano_w = 0
         self._pano_h = 0
 
@@ -1205,29 +1328,46 @@ class ViewerGui:
 
     def _ensure_pano_uploaded(self) -> Optional[PreviewImage]:
         preview = self.state.get_latest_preview()
-        if preview.i420 is None:
+        if preview.frame is None:
             return None
 
         if preview.frame_id != self._last_uploaded_pano_id:
-            frame = preview.i420
+            frame = preview.frame
             self.tex_y.upload_plane(frame.y)
-            self.tex_u.upload_plane(frame.u)
-            self.tex_v.upload_plane(frame.v)
+            if frame.format == YUV420_I420:
+                if frame.u is None or frame.v is None:
+                    raise RuntimeError("I420 frame missing U/V planes during upload")
+                self.tex_u.upload_plane(frame.u)
+                self.tex_v.upload_plane(frame.v)
+            elif frame.format == YUV420_NV12:
+                if frame.uv is None:
+                    raise RuntimeError("NV12 frame missing UV plane during upload")
+                self.tex_uv.upload_plane(frame.uv)
+            else:
+                raise RuntimeError(f"Unsupported YUV420 frame format: {frame.format}")
+            self._pano_format = frame.format
             self._pano_w = frame.width
             self._pano_h = frame.height
             self._last_uploaded_pano_id = preview.frame_id
             self._ptz_dirty = True
+            self._pano_last_rendered_frame = -1
         return preview
 
     def _ensure_pano_rendered(self, preview: PreviewImage) -> None:
         if preview.frame_id == self._pano_last_rendered_frame:
             return
-        if self.tex_y.tex_id == 0 or self.tex_u.tex_id == 0 or self.tex_v.tex_id == 0:
+        if self.tex_y.tex_id == 0:
+            return
+        if self._pano_format == YUV420_I420 and (self.tex_u.tex_id == 0 or self.tex_v.tex_id == 0):
+            return
+        if self._pano_format == YUV420_NV12 and self.tex_uv.tex_id == 0:
             return
         self._pano_out_tex_id = self.pano_renderer.render(
+            self._pano_format,
             self.tex_y.tex_id,
             self.tex_u.tex_id,
             self.tex_v.tex_id,
+            self.tex_uv.tex_id,
             self.ptz_state,
             (self._pano_w, self._pano_h),
             projection_mode=1,
@@ -1273,8 +1413,14 @@ class ViewerGui:
             imgui.text_disabled("Waiting for panorama preview...")
             return
 
-        if self.tex_y.tex_id == 0 or self.tex_u.tex_id == 0 or self.tex_v.tex_id == 0:
+        if self.tex_y.tex_id == 0:
             imgui.text_disabled("PTZ: pano textures not ready yet")
+            return
+        if self._pano_format == YUV420_I420 and (self.tex_u.tex_id == 0 or self.tex_v.tex_id == 0):
+            imgui.text_disabled("PTZ: I420 chroma textures not ready yet")
+            return
+        if self._pano_format == YUV420_NV12 and self.tex_uv.tex_id == 0:
+            imgui.text_disabled("PTZ: NV12 UV texture not ready yet")
             return
 
         self._ensure_pano_rendered(preview)
@@ -1323,9 +1469,11 @@ class ViewerGui:
         out_h = max(1, int(round(self._pano_h * self._ptz_render_scale)))
         if self._ptz_dirty:
             self._ptz_out_tex_id = self.ptz.render(
+                self._pano_format,
                 self.tex_y.tex_id,
                 self.tex_u.tex_id,
                 self.tex_v.tex_id,
+                self.tex_uv.tex_id,
                 self.ptz_state,
                 (out_w, out_h),
                 projection_mode=0,
@@ -1425,6 +1573,7 @@ class ViewerGui:
         self.tex_y.destroy()
         self.tex_u.destroy()
         self.tex_v.destroy()
+        self.tex_uv.destroy()
         self.pano_renderer.destroy()
         self.ptz.destroy()
 
@@ -1504,9 +1653,9 @@ def build_source(args: argparse.Namespace):
         pull_timeout_ms=args.gst_pull_timeout_ms,
     )
     if args.gst_pipeline:
-        desc = "Live camera: custom GStreamer pipeline (expects I420 at appsink)"
+        desc = "Live camera: custom GStreamer pipeline (expects NV12 or I420 at appsink)"
     else:
-        desc = f"Live camera: thetauvcsrc ({args.camera_mode}, I420 shader path)"
+        desc = f"Live camera: thetauvcsrc ({args.camera_mode}, NV12/I420 shader path)"
         if args.theta_serial:
             desc += f" serial={args.theta_serial}"
     return source, desc

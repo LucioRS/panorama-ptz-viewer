@@ -6,3 +6,6 @@ __pycache__
 
 # cache folder
 /cache
+
+# ini files
+*.ini

@@ -12,4 +12,5 @@
 imgui-bundle
 opencv-python
 PyOpenGL
+PyOpenGL-accelerate
 numpy
